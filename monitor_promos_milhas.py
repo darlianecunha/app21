@@ -1,381 +1,294 @@
-# -*- coding: utf-8 -*-
-"""
-Monitor de Promoções de Transferência de Milhas (últimos 3 dias)
------------------------------------------------------------------
-• Fontes (RSS): Passageiro de Primeira, Melhores Destinos, Pontos pra Voar, Império das Milhas
-• Fontes (HTML fallback): páginas de promoções da Smiles e LATAM Pass (quando o RSS não cobre)
-• Filtro por palavras-chave (customizável)
-• Envio por e-mail via Gmail (senha de APP)
-• Notificação opcional via Telegram (se variáveis estiverem configuradas)
-• Log em CSV no Google Drive (opcional)
+# monitor_promos_milhas.py
+# Coleta promoções de bônus de transferência de pontos/milhas (SEM SMILES),
+# filtra pelos últimos N dias e envia e-mail (e opcionalmente Telegram).
+#
+# Lê credenciais do arquivo 'credenciais.txt' (3 linhas):
+#   1) email_user (Gmail)
+#   2) email_app_password (senha de app do Gmail)
+#   3) email_destino
+#
+# Requer (requirements.txt):
+#   feedparser
+#   beautifulsoup4
+#   html5lib
+#   requests
+#   python-dateutil
 
-Como usar no Google Colab
--------------------------
-1) !pip install feedparser beautifulsoup4 html5lib python-dateutil requests
-2) Monte o Google Drive (opcional para salvar logs):
-   from google.colab import drive
-   drive.mount('/content/drive')
-3) Crie um arquivo "credenciais.txt" no seu Drive com 3 linhas:
-   <seu_email_gmail>
-   <sua_senha_de_app>
-   <destinatario>
-4) (Opcional) Defina variáveis de Telegram no ambiente:
-   TELEGRAM_BOT_TOKEN="123:ABC" e TELEGRAM_CHAT_ID="-100123..."
-5) Execute:
-   !python monitor_promos_milhas.py
-"""
-
-import re
-import os
 import csv
-import ssl
-import time
+import os
+import re
 import smtplib
-import logging
-import traceback
+import sys
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from urllib.parse import urlparse
 
-# Dependências web
-try:
-    import feedparser
-except ImportError:
-    raise SystemExit("Instale o feedparser: pip install feedparser")
+import feedparser
+import requests
+from bs4 import BeautifulSoup
+from dateutil import parser as dtparser
 
-try:
-    import requests
-    from bs4 import BeautifulSoup
-except ImportError:
-    raise SystemExit("Instale requests e beautifulsoup4: pip install requests beautifulsoup4 html5lib")
+# ===========================
+# Configurações principais
+# ===========================
+RECENCIA_DIAS = int(os.getenv("RECENCIA_DIAS", "3"))
 
-# ------------------------------
-# Configurações
-# ------------------------------
-TZ_FORTALEZA = timezone(timedelta(hours=-3))  # America/Fortaleza (fixo, sem DST)
-AGORA = datetime.now(TZ_FORTALEZA)
-
-# Palavras de busca (ajuste à vontade)
-KEYWORDS = [
-    # gatilhos gerais
-    "transferência", "transferencia", "transferir", "bônus", "bonus", "bonificação", "bonificacao",
-    "campanha", "promoção", "promocao", "promo",
-    # programas & parceiros comuns no BR
-    "smiles", "latam pass", "esfera", "livelo", "tudoazul", "ame", "inter", "santander",
-    "bradesco", "itau", "bb", "caixa", "shell box",
-    # frases úteis
-    "bônus na transferência", "bonus na transferencia", "bonus de transferência", "bonus de transferencia",
+# Termos positivos (o post precisa bater pelo menos um)
+POSITIVE_TERMS = [
+    r"\b(bônus|bonus)\b",
+    r"\b(bonifica(ç|c)ão|bonificado)\b",
+    r"\btransfer(ê|e)ncia(s)?\b",
+    r"\btransferir\b",
+    r"\blatam pass\b",
+    r"\btudo ?azul\b",
+    r"\besfera\b",
+    r"\blivelo\b",
+    r"\binter loop\b",
+    r"\bbanrisul cartão\b",
+    r"\bsantander\b",
+    r"\bbradesco\b",
+    r"\bitau\b",
+    r"\bbanco do brasil\b",
+    r"\bc6 bank\b",
+    r"\bportabilidade de pontos\b",
 ]
 
-# Dias de recência (padrão = 3)
-RECENCIA_DIAS = 3
+# Termos negativos (se bater, descarta)
+NEGATIVE_TERMS = [
+    r"\bsmiles\b",              # remove todo conteúdo relativo à Smiles
+    r"\bgol smiles\b",
+    r"\bclube smiles\b",
+]
 
-# Fontes RSS (preferidas, mais estáveis)
+# Domínios excluídos (nunca considerar)
+EXCLUDED_DOMAINS = {
+    "smiles.com.br",
+    "blog.smiles.com.br",
+    "loja.smiles.com.br",
+}
+
+# Fontes RSS — sem nenhuma URL da Smiles
 RSS_SOURCES = {
+    # Blogs de viagens/finanças com boa cobertura de bônus de transferência
     "Passageiro de Primeira": "https://passageirodeprimeira.com/feed/",
     "Melhores Destinos": "https://www.melhoresdestinos.com.br/feed",
-    "Pontos pra Voar": "https://www.pontospravoar.com/feed",
-    "Império das Milhas (geral)": "https://imperiodasmilhas.com/feed/",
-    "Império das Milhas (promoções)": "https://imperiodasmilhas.com/categoria/promocoes/feed/",
+    "Pontos pra Viajar": "https://pontospraviajar.com/feed/",
+    "Meu Milhão de Milhas": "https://meumilhaodemilhas.com/feed/",
+    "Passagens Imperdíveis": "https://www.passagensimperdiveis.com.br/feed/",
+    # Adapte/adicione seus preferidos aqui
 }
 
-# Fontes HTML (fallback simples). URLs podem mudar ao longo do tempo.
-HTML_SOURCES = {
-    "Smiles - Promoções": "https://www.smiles.com.br/promocoes",
-    "LATAM Pass - Promoções": "https://latampass.latam.com/pt_br/promocoes",
-}
-
-# Caminhos padrão (pode alterar)
-PADRAO_DRIVE_PATH = "/content/drive/MyDrive"  # se estiver no Colab com Drive
-ARQ_CREDENCIAIS = os.path.join(PADRAO_DRIVE_PATH, "credenciais.txt")
-ARQ_LOG_CSV = os.path.join(PADRAO_DRIVE_PATH, "monitor_promos_milhas_log.csv")
-
-# Telegram (opcional via variáveis de ambiente)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-# ------------------------------
-# Utilitários
-# ------------------------------
-def normalizar_texto(t: str) -> str:
-    return re.sub(r"\s+", " ", (t or "").strip()).lower()
-
-def contem_keywords(texto: str, keywords=KEYWORDS) -> bool:
-    nt = normalizar_texto(texto)
-    return any(k.lower() in nt for k in keywords)
-
-def dentro_da_janela(data_pub: datetime, dias: int = RECENCIA_DIAS) -> bool:
-    if not isinstance(data_pub, datetime):
-        return False
-    limite = AGORA - timedelta(days=dias)
-    return data_pub >= limite
-
-def tentar_parse_datetime(entry):
-    # Tenta pegar a data do item RSS de várias formas
-    for campo in ("published_parsed", "updated_parsed", "created_parsed"):
-        dt = getattr(entry, campo, None) or entry.get(campo)
-        if dt:
-            try:
-                d = datetime.fromtimestamp(time.mktime(dt), tz=timezone.utc).astimezone(TZ_FORTALEZA)
-                return d
-            except Exception:
-                pass
-    for campo in ("published", "updated", "created"):
-        dt_str = getattr(entry, campo, None) or entry.get(campo)
-        if dt_str:
-            try:
-                from email.utils import parsedate_to_datetime
-                d = parsedate_to_datetime(dt_str).astimezone(TZ_FORTALEZA)
-                return d
-            except Exception:
-                pass
-    return None
-
-def http_get(url: str, timeout: int = 20):
+# ===========================
+# Utilidades
+# ===========================
+def limpar_html(texto):
+    if not texto:
+        return ""
     try:
-        requests.packages.urllib3.disable_warnings()
-        resp = requests.get(url, timeout=timeout, verify=False, headers={"User-Agent": "Mozilla/5.0 (PromoBot)"})
-        if resp.status_code == 200 and resp.text:
-            return resp
+        soup = BeautifulSoup(texto, "html5lib")
+        return soup.get_text(" ", strip=True)
     except Exception:
-        logging.warning("Falha ao baixar %s\n%s", url, traceback.format_exc())
+        return re.sub("<[^>]+>", " ", texto)
+
+def dentro_recencia(dt, dias=RECENCIA_DIAS):
+    if not dt:
+        return False
+    agora = datetime.now(timezone.utc)
+    return (agora - dt) <= timedelta(days=dias)
+
+def parse_datetime(entry):
+    # tenta published, updated, etc.
+    candidatos = [
+        getattr(entry, "published", None),
+        getattr(entry, "updated", None),
+        entry.get("published"),
+        entry.get("updated"),
+    ]
+    for c in candidatos:
+        if not c:
+            continue
+        try:
+            d = dtparser.parse(c)
+            # garantir timezone
+            if not d.tzinfo:
+                d = d.replace(tzinfo=timezone.utc)
+            return d.astimezone(timezone.utc)
+        except Exception:
+            continue
+    # fallback: None
     return None
 
-def parse_feed_via_requests(url: str):
-    headers = {"User-Agent": "Mozilla/5.0 (PromoBot)"}
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    return feedparser.parse(resp.content)
+def tem_match(padroes, texto_lower):
+    for p in padroes:
+        if re.search(p, texto_lower, flags=re.IGNORECASE):
+            return True
+    return False
 
-# ------------------------------
-# Coleta via RSS
-# ------------------------------
-def coletar_via_rss(keywords=KEYWORDS, dias=RECENCIA_DIAS):
-    resultados = []
-    for fonte, url in RSS_SOURCES.items():
+def dominio_excluido(link):
+    try:
+        host = urlparse(link).netloc.lower()
+        return any(host == d or host.endswith("." + d) for d in EXCLUDED_DOMAINS)
+    except Exception:
+        return False
+
+# ===========================
+# Coleta
+# ===========================
+def coletar_itens():
+    itens = []
+    for nome, url in RSS_SOURCES.items():
         try:
-            feed = parse_feed_via_requests(url)  # usa requests para evitar 403
+            feed = feedparser.parse(url)
             for entry in feed.entries:
-                titulo = entry.get("title", "")
-                resumo = entry.get("summary", "") or entry.get("description", "") or ""
-                link = entry.get("link", "")
-                data = tentar_parse_datetime(entry)
+                title = limpar_html(getattr(entry, "title", "") or entry.get("title", ""))
+                summary = limpar_html(getattr(entry, "summary", "") or entry.get("summary", ""))
+                link = getattr(entry, "link", "") or entry.get("link", "")
+                dt_pub = parse_datetime(entry)
 
-                texto_alvo = f"{titulo} {resumo}"
-                if contem_keywords(texto_alvo, keywords):
-                    if (data and dentro_da_janela(data, dias)) or (data is None):
-                        resultados.append({
-                            "fonte": fonte,
-                            "titulo": titulo.strip(),
-                            "link": link,
-                            "resumo": BeautifulSoup(resumo, "html.parser").get_text(" ", strip=True),
-                            "data": data.isoformat() if data else "",
-                            "tem_data": bool(data),
-                            "metodo": "RSS",
-                        })
-        except Exception:
-            logging.warning("Erro ao processar RSS de %s (%s)", fonte, url, exc_info=True)
-    return resultados
-
-# ------------------------------
-# Coleta via HTML (fallback simples)
-# ------------------------------
-def coletar_via_html(keywords=KEYWORDS):
-    resultados = []
-    for fonte, url in HTML_SOURCES.items():
-        resp = http_get(url)
-        if not resp:
-            continue
-        try:
-            soup = BeautifulSoup(resp.text, "html.parser")
-            candidatos = []
-            candidatos.extend(soup.select("a[href]"))
-            vistos = set()
-            for a in candidatos:
-                href = a.get("href") or ""
-                texto = a.get_text(" ", strip=True) or ""
-                alvo = f"{texto} {href}"
-                if not href or href.startswith("#"):
+                # filtros básicos
+                if not title or not link:
                     continue
-                if href.startswith("/"):
-                    from urllib.parse import urljoin
-                    href = urljoin(url, href)
-                if contem_keywords(alvo, keywords):
-                    chave = (href, texto.lower())
-                    if chave in vistos:
-                        continue
-                    vistos.add(chave)
-                    resultados.append({
-                        "fonte": fonte,
-                        "titulo": texto[:140] if texto else "(sem título)",
-                        "link": href,
-                        "resumo": "",
-                        "data": "",
-                        "tem_data": False,
-                        "metodo": "HTML",
-                    })
-        except Exception:
-            logging.warning("Erro ao fazer parse HTML de %s", url, exc_info=True)
-    return resultados
+                if dominio_excluido(link):
+                    continue
+                if not dentro_recencia(dt_pub, RECENCIA_DIAS):
+                    continue
 
-# ------------------------------
-# Consolidação e formatação
-# ------------------------------
-def deduplicar(registros):
-    vistos = set()
-    unicos = []
-    for r in registros:
-        chave = (r["titulo"].strip().lower(), r["link"])
-        if chave in vistos:
-            continue
-        vistos.add(chave)
-        unicos.append(r)
-    return unicos
+                texto = f"{title} {summary}".lower()
 
-def ordenar(registros):
-    def key(r):
-        dt = None
-        try:
-            dt = datetime.fromisoformat(r["data"]) if r["data"] else None
-        except Exception:
-            dt = None
-        return (-int(r["tem_data"]), dt if dt else datetime.min.replace(tzinfo=TZ_FORTALEZA), r["fonte"], r["titulo"])
-    return sorted(registros, key=key, reverse=True)
+                # Filtro negativo primeiro
+                if tem_match(NEGATIVE_TERMS, texto):
+                    continue
 
-def formatar_email(registros, dias=RECENCIA_DIAS):
-    if not registros:
-        return f"Nenhuma promoção de transferência de milhas encontrada nos últimos {dias} dias.\n"
-    linhas = [f"📣 Promoções de transferência (últimos {dias} dias)\n"]
-    for r in registros:
-        dt_str = ""
-        if r["data"]:
+                # Filtro positivo (precisa bater algo de bônus/transfer etc.)
+                if not tem_match(POSITIVE_TERMS, texto):
+                    continue
+
+                itens.append({
+                    "fonte": nome,
+                    "titulo": title.strip(),
+                    "resumo": summary.strip(),
+                    "link": link.strip(),
+                    "publicado_em": dt_pub.isoformat() if dt_pub else "",
+                })
+        except Exception as e:
+            print(f"[WARN] Falha ao ler {nome}: {e}")
+    return itens
+
+# ===========================
+# Formatação do e-mail
+# ===========================
+def formatar_email(itens):
+    if not itens:
+        return "Nenhuma promoção relevante (sem Smiles) encontrada nos últimos %d dias." % RECENCIA_DIAS
+
+    linhas = [f"✈️ Promoções de Transferência (últimos {RECENCIA_DIAS} dias) — SEM Smiles\n"]
+    for i, item in enumerate(sorted(itens, key=lambda x: x["publicado_em"], reverse=True), 1):
+        dt_fmt = ""
+        if item["publicado_em"]:
             try:
-                dt = datetime.fromisoformat(r["data"])
-                dt_str = dt.astimezone(TZ_FORTALEZA).strftime("%d/%m/%Y %H:%M")
+                dt_fmt = dtparser.parse(item["publicado_em"]).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             except Exception:
-                dt_str = r["data"]
-        bloco = [
-            f"• Fonte: {r['fonte']}",
-            f"  Título: {r['titulo']}",
-            f"  Link: {r['link']}",
-        ]
-        if dt_str:
-            bloco.append(f"  Data: {dt_str}")
-        if r["resumo"]:
-            bloco.append(f"  Resumo: {r['resumo']}")
-        bloco.append("")
-        linhas.append("\n".join(bloco))
+                dt_fmt = item["publicado_em"]
+        linhas.append(
+            f"{i}. [{item['fonte']}] {item['titulo']}\n"
+            f"   Data: {dt_fmt}\n"
+            f"   Link: {item['link']}\n"
+        )
     return "\n".join(linhas)
 
-def salvar_log_csv(registros, caminho_csv=ARQ_LOG_CSV):
-    os.makedirs(os.path.dirname(caminho_csv), exist_ok=True)
-    cabec = ["coleta_em", "fonte", "titulo", "link", "data", "metodo"]
-    existe = os.path.exists(caminho_csv)
-    existentes = set()
-    if existe:
-        try:
-            with open(caminho_csv, "r", newline="", encoding="utf-8") as f:
-                rd = csv.DictReader(f)
-                for row in rd:
-                    existentes.add((row.get("fonte",""), row.get("link","")))
-        except Exception:
-            pass
-    with open(caminho_csv, "a", newline="", encoding="utf-8") as f:
-        wr = csv.DictWriter(f, fieldnames=cabec)
-        if not existe:
-            wr.writeheader()
-        agora_str = AGORA.strftime("%Y-%m-%d %H:%M:%S%z")
-        for r in registros:
-            chave = (r["fonte"], r["link"])
-            if chave in existentes:
-                continue
-            wr.writerow({
-                "coleta_em": agora_str,
-                "fonte": r["fonte"],
-                "titulo": r["titulo"],
-                "link": r["link"],
-                "data": r["data"],
-                "metodo": r["metodo"],
-            })
+# ===========================
+# E-mail + Telegram
+# ===========================
+def enviar_email(corpo_email, assunto="✈️ Promoções de Transferência de Milhas (últimos 3 dias) • SEM Smiles"):
+    # Lê credenciais.txt (3 linhas)
+    caminho = "credenciais.txt"
+    assert os.path.exists(caminho), f"Arquivo de credenciais não encontrado: {caminho}"
+    with open(caminho, "r", encoding="utf-8") as f:
+        linhas = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+    email_user, email_pass, email_to = linhas[0], linhas[1], linhas[2]
 
-# ------------------------------
-# Coletor principal
-# ------------------------------
-def buscar_promos_milhas(keywords=KEYWORDS, dias=RECENCIA_DIAS, usar_html_fallback=True):
-    rss = coletar_via_rss(keywords, dias)
-    html = coletar_via_html(keywords) if usar_html_fallback else []
-    combinados = ordenar(deduplicar(rss + html))
-    return combinados
-
-# ------------------------------
-# Notificação via Telegram (opcional)
-# ------------------------------
-def enviar_telegram(texto: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": texto[:4000],  # limite básico
-            "disable_web_page_preview": True
-        }
-        r = requests.post(api, data=payload, timeout=15)
-        r.raise_for_status()
-        print("📨 Telegram enviado.")
-    except Exception as e:
-        print("Aviso: falha ao enviar Telegram:", e)
-
-# ------------------------------
-# Envio de e-mail
-# ------------------------------
-def enviar_email(corpo_email: str, caminho_credenciais: str = ARQ_CREDENCIAIS, assunto: str | None = None):
-    assert os.path.exists(caminho_credenciais), f"Arquivo de credenciais não encontrado: {caminho_credenciais}"
-    with open(caminho_credenciais, "r", encoding="utf-8") as f:
-        linhas = [ln.strip() for ln in f.read().strip().splitlines() if ln.strip()]
-    email_user = linhas[0]
-    email_password = linhas[1]  # SENHA DE APP do Gmail
-    email_destino = linhas[2]
-    if not assunto:
-        assunto = f"✈️ Promoções de Transferência de Milhas (últimos {RECENCIA_DIAS} dias)"
     msg = MIMEMultipart()
     msg["From"] = email_user
-    msg["To"] = email_destino
+    msg["To"] = email_to
     msg["Subject"] = assunto
     msg.attach(MIMEText(corpo_email, "plain", "utf-8"))
-    try:
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls(context=ssl.create_default_context())
-        server.login(email_user, email_password)
-        server.send_message(msg)
-        server.quit()
-        print("✅ Email enviado com sucesso!")
-    except Exception as e:
-        print("❌ Erro ao enviar o e-mail:", e)
 
-# ------------------------------
-# Execução direta (CLI)
-# ------------------------------
+    server = smtplib.SMTP("smtp.gmail.com", 587)
+    server.starttls()
+    server.login(email_user, email_pass)
+    server.send_message(msg)
+    server.quit()
+
+def enviar_telegram(texto):
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            data={"chat_id": chat_id, "text": texto},
+            timeout=20,
+        )
+        print("📨 Telegram enviado.")
+    except Exception as e:
+        print(f"[WARN] Telegram falhou: {e}")
+
+# ===========================
+# Persistência do log
+# ===========================
+def salvar_csv(itens, caminho="monitor_promos_milhas_log.csv"):
+    campos = ["timestamp_execucao_utc", "fonte", "titulo", "link", "publicado_em"]
+    ts = datetime.now(timezone.utc).isoformat()
+    novo_arquivo = not os.path.exists(caminho)
+
+    with open(caminho, "a", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=campos)
+        if novo_arquivo:
+            w.writeheader()
+        for it in itens:
+            w.writerow({
+                "timestamp_execucao_utc": ts,
+                "fonte": it["fonte"],
+                "titulo": it["titulo"],
+                "link": it["link"],
+                "publicado_em": it["publicado_em"],
+            })
+    print(f"📝 Log salvo em: {caminho}")
+
+# ===========================
+# Execução principal
+# ===========================
 def main():
-    print(f"🔍 Buscando promoções (Smiles/LATAM Pass + blogs) — janela: {RECENCIA_DIAS} dias...")
-    registros = buscar_promos_milhas(KEYWORDS, RECENCIA_DIAS, usar_html_fallback=True)
-    corpo = formatar_email(registros, RECENCIA_DIAS)
+    print(f"🔍 Buscando promoções (sem Smiles), últimos {RECENCIA_DIAS} dias…")
+    itens = coletar_itens()
+
+    corpo = formatar_email(itens)
     print("\n===== PRÉVIA DO EMAIL =====\n")
     print(corpo)
+    print("\n===========================\n")
+
     try:
-        salvar_log_csv(registros, ARQ_LOG_CSV)
-        print(f"\n📝 Log salvo em: {ARQ_LOG_CSV}")
+        enviar_email(corpo)
+        print("✅ Email enviado com sucesso!")
     except Exception as e:
-        print("Aviso: falha ao salvar log CSV:", e)
-    # Enviar e-mail (se tiver credenciais)
-    if os.path.exists(ARQ_CREDENCIAIS):
-        enviar_email(corpo, ARQ_CREDENCIAIS)
-    else:
-        print(f"\n⚠️ Arquivo de credenciais não encontrado em: {ARQ_CREDENCIAIS}")
-        print("Crie um arquivo 'credenciais.txt' com 3 linhas: email, senha de app, destinatário.")
-    # Telegram opcional
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        enviar_telegram(corpo)
+        print("❌ Erro ao enviar e-mail:", e, file=sys.stderr)
+
+    # mandar resumo curto no Telegram (se configurado)
+    resumo_tg = "Sem novidades relevantes (sem Smiles) nos últimos %d dias." % RECENCIA_DIAS
+    if itens:
+        top = itens[0]
+        resumo_tg = f"Top achado (sem Smiles): [{top['fonte']}] {top['titulo']} — {top['link']}"
+    enviar_telegram(resumo_tg)
+
+    # salvar CSV
+    try:
+        salvar_csv(itens)
+    except Exception as e:
+        print("[WARN] Falha ao salvar CSV:", e, file=sys.stderr)
 
 if __name__ == "__main__":
     main()
+
+        
