@@ -38,4 +38,3 @@ jobs:
           name: milhas-log
           path: monitor_promos_milhas_log.csv
           if-no-files-found: ignore
-
