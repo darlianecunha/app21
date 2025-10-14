@@ -1,4 +1,5 @@
-name: Milhas Promo Monitor
+from pathlib import Path
+yaml_content = """name: Milhas Promo Monitor (v2)
 on:
   schedule:
     - cron: '0 12 * * *'  # 12:00 UTC = 09:00 Fortaleza
@@ -18,10 +19,10 @@ jobs:
       - name: Install requirements
         run: pip install -r requirements.txt
       - name: Create credentials file
-        run: printf "%s\n%s\n%s\n" "${{ secrets.GMAIL_USER }}" "${{ secrets.GMAIL_APP_PASS }}" "${{ secrets.EMAIL_TO }}" > credenciais.txt
+        run: echo -e \"${{ secrets.GMAIL_USER }}\\n${{ secrets.GMAIL_APP_PASS }}\\n${{ secrets.EMAIL_TO }}\" > credenciais.txt
       - name: Run monitor
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}        
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python run_milhas.py
       - name: Upload log artifact
@@ -30,3 +31,6 @@ jobs:
           name: milhas-log
           path: monitor_promos_milhas_log.csv
           if-no-files-found: ignore
+"""
+Path('/mnt/data/milhas2.yml').write_text(yaml_content, encoding='utf-8')
+'/mnt/data/milhas2.yml'
