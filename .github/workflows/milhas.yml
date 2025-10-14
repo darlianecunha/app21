@@ -22,25 +22,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Debug: where am I?
-        run: |
-          pwd
-          ls -la
-
-      - name: Debug: show Python env
-        run: |
-          python -V
-          pip list | sed -n '1,120p'
-
       - name: Create credentials file
         run: |
           printf "%s\n%s\n%s\n" "${{ secrets.GMAIL_USER }}" "${{ secrets.GMAIL_APP_PASS }}" "${{ secrets.EMAIL_TO }}" > credenciais.txt
-          echo "=== credenciais.txt (masking emails) ==="
-          sed -e '1s/.*/[email_user hidden]/' -e '2s/.*/[app_pass hidden]/' -e '3s/.*/[email_to hidden]/' credenciais.txt
-
-      - name: Debug: list files after credentials
-        run: |
-          ls -la
 
       - name: Run monitor
         env:
