@@ -16,6 +16,8 @@ jobs:
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
       - name: Install requirements
+      - name: Check Python deps
+        run: python -c "import feedparser, bs4, html5lib, requests, dateutil; print('deps ok')"
         run: pip install -r requirements.txt
       - name: Create credentials file
         run: printf "%s\n%s\n%s\n" "${{ secrets.GMAIL_USER }}" "${{ secrets.GMAIL_APP_PASS }}" "${{ secrets.EMAIL_TO }}" > credenciais.txt
