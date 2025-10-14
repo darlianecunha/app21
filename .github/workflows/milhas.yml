@@ -1,4 +1,4 @@
-name: Milhas Promo Monitor v3
+name: Milhas Promo Monitor
 on:
   schedule:
     - cron: '0 12 * * *'  # 12:00 UTC = 09:00 Fortaleza
