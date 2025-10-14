@@ -74,6 +74,7 @@ RSS_SOURCES = {
     "Passageiro de Primeira": "https://passageirodeprimeira.com/feed/",
     "Melhores Destinos": "https://www.melhoresdestinos.com.br/feed",
     "Pontos pra Viajar": "https://pontospraviajar.com/feed/",
+    "Pontos para Voar": "https://www.pontosparavoar.com/feed/", 
     "Meu Milhão de Milhas": "https://meumilhaodemilhas.com/feed/",
     "Passagens Imperdíveis": "https://www.passagensimperdiveis.com.br/feed/",
     # Adapte/adicione seus preferidos aqui
