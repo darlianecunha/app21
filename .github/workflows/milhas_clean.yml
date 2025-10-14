@@ -1,0 +1,32 @@
+name: Milhas Promo Monitor CLEAN
+on:
+  schedule:
+    - cron: '0 12 * * *'  # 12:00 UTC = 09:00 Fortaleza
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Create credentials file
+        run: printf "%s\n%s\n%s\n" "${{ secrets.GMAIL_USER }}" "${{ secrets.GMAIL_APP_PASS }}" "${{ secrets.EMAIL_TO }}" > credenciais.txt
+      - name: Run monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python run_milhas.py
+      - name: Upload log artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: milhas-log
+          path: monitor_promos_milhas_log.csv
+          if-no-files-found: ignore
