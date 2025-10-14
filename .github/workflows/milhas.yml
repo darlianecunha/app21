@@ -1,4 +1,5 @@
 from pathlib import Path
+
 yaml_content = """name: Milhas Promo Monitor (v2)
 on:
   schedule:
