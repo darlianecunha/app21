@@ -12,7 +12,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+           - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -25,6 +25,9 @@ jobs:
 
       - name: Check Python deps
         run: python -c "import feedparser, bs4, html5lib, requests, dateutil; print('deps ok')"
+
+      - name: Show pip list
+        run: python -m pip list | sed -n '1,200p'
 
       - name: Create credentials file
         run: printf "%s\n%s\n%s\n" "${{ secrets.GMAIL_USER }}" "${{ secrets.GMAIL_APP_PASS }}" "${{ secrets.EMAIL_TO }}" > credenciais.txt
